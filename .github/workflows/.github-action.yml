@@ -56,8 +56,8 @@ jobs:
         -w /workspace \
         $DOCKER_YQ_IMAGE \
         -i '.image.tag = "'$COMMIT_SHA_SHORT'"' $CHART_VALUES_FILE
-        git config --global user.email "quoc9x@gmail.com" 
-        git config --global user.name "quoc9x" 
+        git config --global user.email "aquangvm@gmail.com" 
+        git config --global user.name "aquangvm" 
         git add . 
         git commit -m "[BOT] Update image tag to $COMMIT_SHA_SHORT"
         git push
