@@ -1,0 +1,172 @@
+variables:
+  # /roject-registry/project-gitlav:tag_commt
+  DOCKER_IMAGE: $CI_PROJECT_NAME:${CI_COMMIT_TAG}_${CI_COMMIT_SHORT_SHA}
+  DOCKER_IMAGE_LATEST: $CI_PROJECT_NAME:latest
+  DOCKER_CONTAIRNER: $CI_PROJECT_NAME
+  CHART_GIT_URL: gitlab.demo.dev/quangvm/helm-demo-cicd.git
+  GITLAB_USER: quangvm
+  DOCKER_YQ_IMAGE: mikefarah/yq:4
+  CHART_VALUES_FILE: values.yaml
+  PAT: $GITLAB_TOKEN
+  VERSION_FILE: Chart.yaml
+  REGISTRY_URL: demo.goharbor.io
+  ARGOCD_SERVER: '10.10.99.71:31886'
+  SONAR_HOST: "http://10.10.99.74:9000"
+  SONAR_TOKEN: "sqp_5bcfd1bd408abf55dcaf9f273e9d229320a4c4c8"
+stages:
+  - check
+  - build
+  - deploy
+  - checklog
+  - notify
+  - analyze
+  - test
+
+
+Push Image:
+  stage: build
+  variables:
+    GIT_SSL_NO_VERIFY: "1"
+    GIT_STRATEGY: clone
+    
+  before_script:
+   # - echo "$DOCKER_PASSWORD" | docker login "$REGISTRY_URL" --username "$DOCKER_USERNAME" --password-stdin
+     - echo "VgAYR9YsYZEZ" | docker login registry.gviet.vn:5000 --username quangvm --password-stdin
+  script:
+    - pwd
+    - docker build -t $DOCKER_IMAGE .
+    - echo $DOCKER_IMAGE
+    # - docker tag $DOCKER_IMAGE $REGISTRY_URL/quangvm/$DOCKER_IMAGE
+    # - docker push $REGISTRY_URL/quangvm/$DOCKER_IMAGE
+    
+    - docker tag $DOCKER_IMAGE_LATEST registry.gviet.vn:5000/demo/$DOCKER_IMAGE
+    - docker push registry.gviet.vn:5000/demo/$DOCKER_IMAGE
+  tags:
+    - demo
+  # only:
+  #   - tags 
+  rules: 
+    - if: '$CI_COMMIT_TAG'      
+    - if: '$CI_PIPELINE_SOURCE == "api"'  
+  
+
+Push Helm:
+  stage: deploy
+  variables:
+    GIT_SSL_NO_VERIFY: "1"
+    GIT_STRATEGY: none
+
+  before_script:
+    - helm registry login https://demo.goharbor.io/ --username admin --password Harbor12345
+  script:
+      - git clone http://$GITLAB_USER:$PAT@$CHART_GIT_URL chart && cd chart
+
+      - export VERSION=$(grep 'version:' $VERSION_FILE | awk '{print $2}')
+      - echo $VERSION
+      - NEW_VERSION=$(echo $VERSION | awk -F. -v OFS=. '{$2++; $3=0; print}')
+      - echo $NEW_VERSION
+      #- sed -i "s/'version:' $VERSION/'version:' $NEW_VERSION/" $VERSION_FILE
+
+      - docker run --rm --user="root" -v "${PWD}":/workspace -w /workspace $DOCKER_YQ_IMAGE -i '.image.tag = "'${CI_COMMIT_TAG}_${CI_COMMIT_SHORT_SHA}'"' $CHART_VALUES_FILE
+
+      - docker run --rm --user="root" -v "${PWD}":/workspace -w /workspace $DOCKER_YQ_IMAGE eval -i '.version = "'$NEW_VERSION'"' $VERSION_FILE
+
+      - export HELM_NAME=$(grep 'name:' $VERSION_FILE | awk '{print $2}')
+      - helm package .
+      - helm push $HELM_NAME-$NEW_VERSION.tgz oci://demo.goharbor.io/demo-helm
+      
+      - rm -rf $HELM_NAME-$NEW_VERSION.tgz
+      
+      - git config --global user.email "quang@quang.vn" 
+      - git config --global user.name "quangvm"
+      - git add . 
+      - git commit -m "[BOT] Update image tag to $CI_COMMIT_SHORT_SHA"
+      - git push 
+  tags:
+    - demo
+  # only:
+  #   - tags   
+  rules:
+    - if: '$CI_COMMIT_TAG'  
+    - if: '$CI_PIPELINE_SOURCE == "api"'      
+
+# test:
+#   stage: test
+#   variables:
+#     GIT_SSL_NO_VERIFY: "1"
+#     GIT_STRATEGY: none
+#   script:
+#     - docker run --rm --user="root -v "${PWD}":/workspace -w /workspace golang:1.22-alpine3.19 go test -coverprofile=coverage.out
+#     - docker run --rm --user="root -v "${PWD}":/workspace -w /workspace golang:1.22-alpine3.19 go tool cover -html=coverage.out -o coverage.html
+#   tags:
+#     - demo
+
+#   rules:
+#     - if: '$CI_COMMIT_TAG'  
+#     - if: '$CI_PIPELINE_SOURCE == "api"'  
+
+sonarqube:
+  stage: analyze  
+  variables:
+    GIT_SSL_NO_VERIFY: "1"
+    GIT_STRATEGY: none
+  # image: sonarsource/sonar-scanner-cli
+  script:
+    - whoami
+    - rm -f coverage.out
+    - docker run --rm -v "${PWD}":/workspace -w /workspace golang:1.22-alpine3.19 go test -cover ./...
+    - docker run --rm -v "${PWD}":/workspace -w /workspace golang:1.22-alpine3.19 go test -coverprofile=coverage.out ./...
+    - docker run --rm -v "${PWD}":/workspace -w /workspace golang:1.22-alpine3.19 go tool cover -html=coverage.out
+    - docker run --rm --user="root" -v "${PWD}":/workspace -w /workspace sonarsource/sonar-scanner-cli sonar-scanner -Dsonar.projectKey=demo-cicd -Dsonar.sources=. -Dsonar.host.url=$SONAR_HOST -Dsonar.token=$SONAR_TOKEN
+    # - sonar-scanner -Dsonar.projectKey=demo-cicd -Dsonar.sources=. -Dsonar.host.url=$SONAR_HOST -Dsonar.token=$SONAR_TOKEN
+
+  tags:
+    - demo
+
+  rules:
+    - if: '$CI_COMMIT_TAG'  
+    - if: '$CI_PIPELINE_SOURCE == "api"'    
+
+
+
+notify_success:
+  stage: notify
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - if [ "$CI_PIPELINE_STATUS" == "success" ]; then 
+        export MESSAGE="Pipeline succeeded for project ${CI_PROJECT_NAME} on branch ${CI_COMMIT_REF_NAME}"; 
+      fi
+  after_script:
+    - MESSAGE=$(echo "✅ Pipeline succeeded for project ${CI_PROJECT_NAME} on branch ${CI_COMMIT_REF_NAME}")
+    - curl -X POST "https://api.telegram.org/bot$TOKEN_TELEGRAM_BOT/sendMessage" -d "chat_id=$CHAT_ID" -d "text=$MESSAGE"
+  when: on_success
+  tags:
+    - demo
+  # only:
+  #   - tags   
+  rules:   
+    - if: '$CI_COMMIT_TAG'   
+    - if: '$CI_PIPELINE_SOURCE == "api"'     
+
+
+# Thông báo khi một stage bị lỗi
+notify_failure:
+  stage: notify
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - if [ "$CI_PIPELINE_STATUS" == "failed" ]; then
+        export MESSAGE="Pipeline failed in project ${CI_PROJECT_NAME} on branch ${CI_COMMIT_REF_NAME}";
+      fi
+  after_script:
+    - MESSAGE=$(echo "❌ Pipeline failed in project ${CI_PROJECT_NAME} on branch ${CI_COMMIT_REF_NAME}")
+    - curl -X POST "https://api.telegram.org/bot$TOKEN_TELEGRAM_BOT/sendMessage" -d "chat_id=$CHAT_ID" -d "text=$MESSAGE"
+  when: on_failure
+  tags:
+    - demo
+  # only:
+  #   - tags   
+  rules:
+     - if: '$CI_COMMIT_TAG'  
+     - if: '$CI_PIPELINE_SOURCE == "api"'    
