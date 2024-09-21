@@ -1,0 +1,241 @@
+pipeline {
+    agent {
+        kubernetes {
+            yaml """
+                apiVersion: v1
+                kind: Pod
+                spec:
+                    containers:
+                    - name: full
+                      image: quangvm/alpine-demo-cicd
+                      command:
+                      - cat
+                      tty: true
+                      volumeMounts:
+                      - name: docker-socket
+                        mountPath: /var/run/docker.sock
+                   
+                    volumes:
+                    - name: docker-socket
+                      hostPath:
+                        path: /var/run/docker.sock
+                    
+                    
+                      
+            """
+        }
+    }
+
+     environment {
+        PROJECT_NAME = "demo-cicd"
+        harboruser = credentials('HARBOR_USER')
+        harborpass = credentials('HARBOR_PASS')
+        k8sConfig = credentials('k8sdemoConfig')
+        DOCKER_IMAGE = "demo-cicd:$BUILD_NUMBER"
+        CHART_GIT_URL= "10.10.99.71:32528/quangvm/helm-demo-cicd.git"
+        GITLAB_USER =  "quangvm"
+        DOCKER_YQ_IMAGE = "mikefarah/yq:4"
+        DOCKER_ARGOCD_IMAGE = "rapidfort/argocd"
+        CHART_VALUES_FILE =  "values.yaml"
+        PAT = credentials('gitlab-token')
+        VERSION_FILE = "Chart.yaml"
+        REGISTRY_URL = 'https://demo.goharbor.io'
+        HARBOR_URL = 'demo.goharbor.io'
+        TOKEN_TELEGRAM_BOT = '7430537801:AAHT8UzLZDnuSbI6Rjh8nwiTWJqBGQKMi-c'
+        CHAT_ID = '1353628980'
+        ARGOCD_SERVER = '10.10.99.71:31886'
+        DOCKER_KUBECTL_IMAGE = "bitnami/kubectl"
+
+    }
+
+
+
+        
+    stages {
+
+        stage('login docker and helm') {
+            steps {
+                container('full') {
+                    sh 'git config --global --add safe.directory /home/jenkins/agent/workspace/demo/demo-cicd'
+                    sh """
+                    echo "VgAYR9YsYZEZ" | docker login registry.gviet.vn:5000 --username quangvm --password-stdin
+                    """
+
+                     sh """
+                    helm registry login $REGISTRY_URL --username admin --password Harbor12345
+                    """
+                }
+            }
+
+        }
+
+        
+
+        stage('Build and Push image') {
+            steps {
+              
+                container('full') {
+                    sh 'docker build -t $DOCKER_IMAGE .'
+                  //  sh 'echo "$harborpass" | docker login "$REGISTRY_URL" --username "$harboruser" --password-stdin'
+                    sh 'docker tag $DOCKER_IMAGE registry.gviet.vn:5000/demo/$DOCKER_IMAGE'
+                    sh 'docker push registry.gviet.vn:5000/demo/$DOCKER_IMAGE'
+                }
+            }
+        }
+
+        stage('Push helm chart') {
+            steps {
+                container('full') {
+                    sh 'git clone http://$GITLAB_USER:$PAT@$CHART_GIT_URL chart'
+                    dir('chart') {
+                        script  {
+
+                                def currentVersion = sh(script: """grep 'version:' $VERSION_FILE | awk '{print \$2}'""", returnStdout: true).trim()
+                                echo "Current Version: ${currentVersion}"
+                                def (major, minor, patch) = currentVersion.tokenize('.').collect { it as int }
+                                patch += 1
+                                def newVersion = "${major}.${minor}.${patch}"
+                                echo "New Version: ${newVersion}"
+                                env.NEW_VERSION = newVersion
+                                sh(script: """
+                                    sed -i 's/version: ${currentVersion}/version: ${newVersion}/' $VERSION_FILE""")
+
+                                sh(script: """
+                                    sed -i '/image:/,/tag:/ s/tag:.*/tag: $BUILD_NUMBER/' $CHART_VALUES_FILE""")
+
+                                sh(script: """git config --global user.email "quang@quang.vn"  """)
+                                sh(script: """git config --global user.name "quangvm"  """)
+                                sh(script: """git add .  """)
+                                sh(script: """git commit -m "[BOT] Update image tag to $DOCKER_IMAGE" """)
+                                sh(script: """git push  """)
+
+                                def helmname = sh(script: """grep 'name:' $VERSION_FILE | awk '{print \$2}'""", returnStdout: true).trim()
+                                env.CHAR_NAME = helmname
+                                sh(script: """helm package .  """)
+                                sh(script: """helm push ${helmname}-${NEW_VERSION}.tgz oci://demo.goharbor.io/demo-helm  """)
+                                
+                                
+                            }
+                    }
+                }
+            }   
+
+             
+        }
+        
+
+      
+
+        
+        stage('Deploy argoCD') {
+            steps {
+                container('full') {
+                    script {
+                        
+                        sh(script: """argocd login ${ARGOCD_SERVER} --username admin --password Abc@1234 --insecure""")
+   
+                        def appExists = sh(script: "argocd app get abc --server ${ARGOCD_SERVER} --insecure" , returnStatus: true) == 0
+                        
+
+                        if(!appExists) {
+                            echo "Application does not exist, creating application..."
+                            def newFile = 'app-${PROJECT_NAME}.yaml'
+                            sh(script: """mv app-example.yaml  ${newFile}""")
+                              
+                            sh(script: """
+                                    sed -i '/metadata:/,/name:/ s/name:.*/name: "$PROJECT_NAME"/' $newFile""")
+
+                            
+
+                            sh(script: """
+                                    sed -i '/source:/,/repoURL:/ s|repoURL:.*|repoURL: $HARBOR_URL/demo-helm|' $newFile """)
+
+                            sh(script: """
+                                    sed -i '/source:/,/chart:/ s/chart:.*/chart: "${env.CHAR_NAME}"/' $newFile""")
+                            
+                            sh(script: """argocd app create -f $newFile""")
+
+                            def pipelineInfo = """\
+                            ===ArgoCD create application info ===
+                            Applicaton name: $PROJECT_NAME
+                            repoURL: "$HARBOR_URL/demo-helm"
+                            chart: "${env.CHAR_NAME}"
+                            """
+
+                            def message = "${pipelineInfo}\n\nDone!!!"
+                            
+                            sh """
+
+                            curl -X POST "https://api.telegram.org/bot$TOKEN_TELEGRAM_BOT/sendMessage" \
+                                -d "chat_id=$CHAT_ID&text=${message}"
+                            """
+                        
+                        }
+                        else {
+                            echo "Application already exists, skipping creation."
+                        }
+                    }
+                } 
+            }
+        }
+    }
+
+    post {
+        failure {
+            container('full') {
+                script {
+                
+                def commitSHA = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
+                        def pipelineInfo = """\
+                        ===Pipeline info ===
+                        Project name: $JOB_NAME
+                        Pipeline url: $BUILD_URL
+                        Branch: "main"
+                        Commit: $commitSHA
+                        """
+
+                        def message = "${pipelineInfo}\n\nFailed!!!"
+                        
+                        sh """
+
+                        curl -X POST "https://api.telegram.org/bot$TOKEN_TELEGRAM_BOT/sendMessage" \
+                            -d "chat_id=$CHAT_ID&text=${message}"
+                        """
+                }
+            }
+        }
+        success {
+            container('full') {
+                script {
+                
+                    def commitSHA = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
+                        def pipelineInfo = """\
+                        ===Pipeline info ===
+                        Project name: $JOB_NAME
+                        Pipeline url: $BUILD_URL
+                        Branch: "main"
+                        Commit: $commitSHA
+                        """
+
+                        def message = "${pipelineInfo}\n\nDone!!!"
+                        
+                        sh """
+
+                        curl -X POST "https://api.telegram.org/bot$TOKEN_TELEGRAM_BOT/sendMessage" \
+                            -d "chat_id=$CHAT_ID&text=${message}"
+                        """
+                }
+            }
+        }
+    }
+}
+
+
+
+   
+
+
+
+
+    
+
